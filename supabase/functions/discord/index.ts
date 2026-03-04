@@ -161,24 +161,36 @@ async function handleSync(userId: string): Promise<string> {
     return `✅ Already up to date\n\n**Branch:** ${TARGET_BRANCH}\n**Current SHA:** \`${shortFork}\``
   }
   
-  console.log('Fork is behind, starting merge...')
+  console.log('Fork is behind upstream, attempting to sync...')
   
-  // Try to merge
   try {
-    // Check if upstream commit exists in fork
-    console.log('Checking if upstream commit exists in fork...')
-    try {
-      await githubRequest(`/repos/${GITHUB_OWNER}/${GITHUB_REPO}/git/commits/${upstreamSha}`)
-      console.log('Upstream commit found in fork')
-    } catch (e: any) {
-      console.error('Upstream commit not found:', e)
-      throw new Error(`Upstream commit ${shortUpstream} not found in fork. Please run: git remote add upstream https://github.com/${UPSTREAM_OWNER}/${UPSTREAM_REPO}.git && git fetch upstream`)
+    // First, try the Compare API to see what's different
+    console.log('Checking differences between branches...')
+    const compare = await githubRequest(`/repos/${UPSTREAM_OWNER}/${UPSTREAM_REPO}/compare/${forkSha}...${upstreamSha}`)
+    
+    console.log(`Found ${compare.ahead_by} commits ahead, ${compare.behind_by} commits behind`)
+    console.log(`Files changed: ${compare.files?.length || 0}`)
+    
+    // Check if there are any conflicts
+    const conflicts = compare.files?.filter((f: any) => f.status === 'conflict')
+    if (conflicts && conflicts.length > 0) {
+      console.log('Merge conflicts detected:', conflicts.length)
+      await logToSupabase('sync_logs', {
+        triggered_by: userId,
+        upstream_sha: upstreamSha,
+        merge_sha: null,
+        status: 'conflict',
+      })
+      
+      return `⚠️ Merge conflict detected\n\n**Upstream SHA:** \`${shortUpstream}\`\n**Your SHA:** \`${shortFork}\`\n**Conflicting files:** ${conflicts.length}\n\nPlease resolve manually:\n\`\`\`git remote add upstream https://github.com/${UPSTREAM_OWNER}/${UPSTREAM_REPO}.git\ngit fetch upstream\ngit checkout ${TARGET_BRANCH}\ngit merge upstream/${UPSTREAM_BRANCH}\n# Resolve conflicts\ngit push\`\`\``
     }
-
-    // Create temporary branch for upstream commit
-    console.log('Creating temporary branch...')
-    const tempBranch = `temp-sync-${Date.now()}`
+    
+    // Try to create/update a temporary branch with upstream commit
+    console.log('Creating temporary branch for upstream commit...')
+    const tempBranch = `upstream-sync-${Date.now()}`
+    
     try {
+      // Try to create a new branch pointing to upstream commit
       await githubRequest(`/repos/${GITHUB_OWNER}/${GITHUB_REPO}/git/refs`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -189,66 +201,75 @@ async function handleSync(userId: string): Promise<string> {
       })
       console.log('Temp branch created:', tempBranch)
     } catch (e: any) {
-      console.log('Temp branch check:', e.message)
+      console.log('Could not create temp branch, trying to update existing...')
+      // If that fails, the upstream commit might not be accessible
+      // This means the fork needs to fetch from upstream
+      throw new Error(`Cannot access upstream commit ${shortUpstream} in fork. Please run:\n\`\`\`git remote add upstream https://github.com/${UPSTREAM_OWNER}/${UPSTREAM_REPO}.git\ngit fetch upstream\n\`\`\`\nThen try /sync again.`)
     }
-
-    // Merge using temp branch
+    
+    // Try to merge the temp branch
     console.log('Merging temp branch into target...')
-    const mergeResp = await githubRequest(`/repos/${GITHUB_OWNER}/${GITHUB_REPO}/merges`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        base: TARGET_BRANCH,
-        head: tempBranch,
-        commit_message: `Merge upstream/${UPSTREAM_BRANCH} into ${TARGET_BRANCH}`,
-      }),
-    })
-    
-    console.log('Merge response received, status:', mergeResp ? 'has data' : 'null/empty')
-    
-    // Delete temp branch
-    console.log('Deleting temp branch...')
     try {
-      await githubRequest(`/repos/${GITHUB_OWNER}/${GITHUB_REPO}/git/refs/heads/${tempBranch}`, {
-        method: 'DELETE',
+      const mergeResp = await githubRequest(`/repos/${GITHUB_OWNER}/${GITHUB_REPO}/merges`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          base: TARGET_BRANCH,
+          head: tempBranch,
+          commit_message: `Merge upstream/${UPSTREAM_BRANCH} into ${TARGET_BRANCH}`,
+        }),
       })
-    } catch {}
-    console.log('Temp branch deleted')
-    
-    // If merge returned null, it might mean nothing to merge or already merged
-    if (!mergeResp) {
-      console.log('Merge returned null, checking current branch state')
-      const currentForkResp = await githubRequest(`/repos/${GITHUB_OWNER}/${GITHUB_REPO}/git/refs/heads/${TARGET_BRANCH}`)
-      const currentForkSha = currentForkResp.object.sha
       
-      if (currentForkSha === upstreamSha) {
-        console.log('Fork is now at upstream SHA')
-        await logToSupabase('sync_logs', {
-          triggered_by: userId,
-          upstream_sha: upstreamSha,
-          merge_sha: currentForkSha,
-          status: 'success',
+      // Clean up temp branch
+      try {
+        await githubRequest(`/repos/${GITHUB_OWNER}/${GITHUB_REPO}/git/refs/heads/${tempBranch}`, {
+          method: 'DELETE',
         })
-        return `✅ Sync successful!\n\n**Upstream SHA:** \`${shortUpstream}\`\n**Current SHA:** \`${shortUpstream}\`\n**Branch:** ${UPSTREAM_OWNER}/${UPSTREAM_BRANCH} → ${GITHUB_OWNER}/${TARGET_BRANCH}`
-      } else {
-        throw new Error('Merge API returned empty response and branch was not updated. There may be a merge conflict.')
+      } catch {}
+      
+      if (!mergeResp) {
+        // Check if branch was updated anyway
+        const updatedFork = await githubRequest(`/repos/${GITHUB_OWNER}/${GITHUB_REPO}/git/refs/heads/${TARGET_BRANCH}`)
+        if (updatedFork.object.sha === upstreamSha) {
+          console.log('Branch was fast-forwarded to upstream')
+          await logToSupabase('sync_logs', {
+            triggered_by: userId,
+            upstream_sha: upstreamSha,
+            merge_sha: upstreamSha,
+            status: 'success',
+          })
+          return `✅ Sync successful (fast-forward)!\n\n**Upstream SHA:** \`${shortUpstream}\`\n**Branch:** ${UPSTREAM_OWNER}/${UPSTREAM_BRANCH} → ${GITHUB_OWNER}/${TARGET_BRANCH}\n**Commits:** ${compare.ahead_by}`
+        }
+        throw new Error('Merge failed and branch was not updated')
       }
+      
+      console.log('Merge successful')
+      const mergeSha = mergeResp.sha
+      
+      await logToSupabase('sync_logs', {
+        triggered_by: userId,
+        upstream_sha: upstreamSha,
+        merge_sha: mergeSha,
+        status: 'success',
+      })
+      
+      return `✅ Sync successful!\n\n**Upstream SHA:** \`${shortUpstream}\`\n**Merge SHA:** \`${mergeSha.substring(0, 7)}\`\n**Branch:** ${UPSTREAM_OWNER}/${UPSTREAM_BRANCH} → ${GITHUB_OWNER}/${TARGET_BRANCH}\n**Commits:** ${compare.ahead_by}`
+      
+    } catch (mergeError: any) {
+      // Clean up temp branch on error
+      try {
+        await githubRequest(`/repos/${GITHUB_OWNER}/${GITHUB_REPO}/git/refs/heads/${tempBranch}`, {
+          method: 'DELETE',
+        })
+      } catch {}
+      throw mergeError
     }
-    
-    const mergeSha = mergeResp.sha
-    const shortMerge = mergeSha.substring(0, 7)
-    
-    await logToSupabase('sync_logs', {
-      triggered_by: userId,
-      upstream_sha: upstreamSha,
-      merge_sha: mergeSha,
-      status: 'success',
-    })
-    
-    return `✅ Sync successful!\n\n**Upstream SHA:** \`${shortUpstream}\`\n**Merge SHA:** \`${shortMerge}\`\n**Branch:** ${UPSTREAM_OWNER}/${UPSTREAM_BRANCH} → ${GITHUB_OWNER}/${TARGET_BRANCH}`
     
   } catch (error: any) {
-    if (error.message.includes('405') || error.message.includes('409')) {
+    console.error('Sync error:', error)
+    
+    // Check if it's a conflict error
+    if (error.message.includes('405') || error.message.includes('409') || error.message.includes('conflict')) {
       await logToSupabase('sync_logs', {
         triggered_by: userId,
         upstream_sha: upstreamSha,
@@ -256,8 +277,9 @@ async function handleSync(userId: string): Promise<string> {
         status: 'conflict',
       })
       
-      return `⚠️ Merge conflict\n\n**Upstream SHA:** \`${shortUpstream}\`\n**Your SHA:** \`${shortFork}\`\n\nPlease resolve manually:\n\`\`\`git fetch upstream\ngit checkout ${TARGET_BRANCH}\ngit merge upstream/${UPSTREAM_BRANCH}\n# Resolve conflicts\ngit push\`\`\``
+      return `⚠️ Merge conflict\n\n**Upstream SHA:** \`${shortUpstream}\`\n**Your SHA:** \`${shortFork}\`\n\nPlease resolve manually:\n\`\`\`git remote add upstream https://github.com/${UPSTREAM_OWNER}/${UPSTREAM_REPO}.git\ngit fetch upstream\ngit checkout ${TARGET_BRANCH}\ngit merge upstream/${UPSTREAM_BRANCH}\n# Resolve conflicts\ngit push\`\`\``
     }
+    
     throw error
   }
 }
