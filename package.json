@@ -5,7 +5,10 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "register-commands": "node scripts/register-commands.js"
+    "register-commands": "node scripts/register-commands.js",
+    "add-user": "node scripts/add-user.js",
+    "list-users": "node scripts/add-user.js list",
+    "remove-user": "node scripts/add-user.js remove"
   },
   "keywords": [
     "discord",
