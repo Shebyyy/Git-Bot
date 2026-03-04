@@ -204,12 +204,7 @@ async function handleSync(userId: string): Promise<string> {
       }),
     })
     
-    console.log('Merge response received')
-    if (!mergeResp) {
-      throw new Error('Merge API returned empty response')
-    }
-    
-    console.log('Merge successful, SHA:', mergeResp.sha.substring(0, 7))
+    console.log('Merge response received, status:', mergeResp ? 'has data' : 'null/empty')
     
     // Delete temp branch
     console.log('Deleting temp branch...')
@@ -219,6 +214,26 @@ async function handleSync(userId: string): Promise<string> {
       })
     } catch {}
     console.log('Temp branch deleted')
+    
+    // If merge returned null, it might mean nothing to merge or already merged
+    if (!mergeResp) {
+      console.log('Merge returned null, checking current branch state')
+      const currentForkResp = await githubRequest(`/repos/${GITHUB_OWNER}/${GITHUB_REPO}/git/refs/heads/${TARGET_BRANCH}`)
+      const currentForkSha = currentForkResp.object.sha
+      
+      if (currentForkSha === upstreamSha) {
+        console.log('Fork is now at upstream SHA')
+        await logToSupabase('sync_logs', {
+          triggered_by: userId,
+          upstream_sha: upstreamSha,
+          merge_sha: currentForkSha,
+          status: 'success',
+        })
+        return `✅ Sync successful!\n\n**Upstream SHA:** \`${shortUpstream}\`\n**Current SHA:** \`${shortUpstream}\`\n**Branch:** ${UPSTREAM_OWNER}/${UPSTREAM_BRANCH} → ${GITHUB_OWNER}/${TARGET_BRANCH}`
+      } else {
+        throw new Error('Merge API returned empty response and branch was not updated. There may be a merge conflict.')
+      }
+    }
     
     const mergeSha = mergeResp.sha
     const shortMerge = mergeSha.substring(0, 7)
@@ -416,12 +431,17 @@ async function githubRequest(endpoint: string, options: RequestInit = {}): Promi
     },
   })
 
+  // Handle 204 No Content responses
+  if (response.status === 204) {
+    return null
+  }
+
   if (!response.ok) {
     const error = await response.text()
     throw new Error(`GitHub API error (${response.status}): ${error}`)
   }
 
-  // Handle empty responses (like 204 No Content)
+  // Handle empty responses
   const text = await response.text()
   if (!text) {
     return null
