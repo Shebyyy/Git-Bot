@@ -148,9 +148,34 @@ async function handleSync(userId: string): Promise<string> {
   const shortUpstream = upstreamSha.substring(0, 7)
   const shortFork = forkSha.substring(0, 7)
   
-  // Check if already synced
+  // Check if already synced - use Compare API to check ancestry
+  console.log('Checking if upstream is already merged...')
+  try {
+    const compare = await githubRequest(`/repos/${GITHUB_OWNER}/${GITHUB_REPO}/compare/${forkSha}...${upstreamSha}`)
+    
+    // If merge_base_commit == upstreamSha, then upstream is already in fork's history
+    if (compare.merge_base_commit && compare.merge_base_commit.sha === upstreamSha) {
+      console.log('Upstream commit is already in fork history - already synced!')
+      await logToSupabase('sync_logs', {
+        triggered_by: userId,
+        upstream_sha: upstreamSha,
+        merge_sha: forkSha,
+        status: 'already_up_to_date',
+      })
+      
+      return `✅ Already up to date\n\n**Branch:** ${TARGET_BRANCH}\n**Upstream commit:** \`${shortUpstream}\` is already in your ${TARGET_BRANCH} branch\n**Current HEAD:** \`${shortFork}\``
+    }
+    
+    // If we got here, there are commits to merge
+    console.log(`Upstream is ${compare.behind_by} commits ahead, need to sync`)
+    
+  } catch (e: any) {
+    console.log('Compare API failed, continuing with merge attempt:', e.message)
+  }
+  
+  // Simple check: if SHAs match, definitely synced
   if (upstreamSha === forkSha) {
-    console.log('Already up to date')
+    console.log('SHAs match - already synced')
     await logToSupabase('sync_logs', {
       triggered_by: userId,
       upstream_sha: upstreamSha,
@@ -164,7 +189,7 @@ async function handleSync(userId: string): Promise<string> {
   console.log('Fork is behind upstream, attempting to sync...')
   
   try {
-    // First, try the Compare API to see what's different
+    // Check for conflicts using Compare API on upstream repo
     console.log('Checking differences between branches...')
     const compare = await githubRequest(`/repos/${UPSTREAM_OWNER}/${UPSTREAM_REPO}/compare/${forkSha}...${upstreamSha}`)
     
@@ -185,12 +210,24 @@ async function handleSync(userId: string): Promise<string> {
       return `⚠️ Merge conflict detected\n\n**Upstream SHA:** \`${shortUpstream}\`\n**Your SHA:** \`${shortFork}\`\n**Conflicting files:** ${conflicts.length}\n\nPlease resolve manually:\n\`\`\`git remote add upstream https://github.com/${UPSTREAM_OWNER}/${UPSTREAM_REPO}.git\ngit fetch upstream\ngit checkout ${TARGET_BRANCH}\ngit merge upstream/${UPSTREAM_BRANCH}\n# Resolve conflicts\ngit push\`\`\``
     }
     
-    // Try to create/update a temporary branch with upstream commit
+    // If no commits to merge (0 ahead), we're actually up to date
+    if (compare.ahead_by === 0 && compare.behind_by > 0) {
+      console.log('No commits ahead, but some behind - likely already merged')
+      await logToSupabase('sync_logs', {
+        triggered_by: userId,
+        upstream_sha: upstreamSha,
+        merge_sha: forkSha,
+        status: 'already_up_to_date',
+      })
+      
+      return `✅ Already up to date\n\n**Branch:** ${TARGET_BRANCH}\n**Upstream commit:** \`${shortUpstream}\` is already in your ${TARGET_BRANCH} branch\n**Current HEAD:** \`${shortFork}\``
+    }
+    
+    // Try to create a temporary branch with upstream commit
     console.log('Creating temporary branch for upstream commit...')
     const tempBranch = `upstream-sync-${Date.now()}`
     
     try {
-      // Try to create a new branch pointing to upstream commit
       await githubRequest(`/repos/${GITHUB_OWNER}/${GITHUB_REPO}/git/refs`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -201,10 +238,7 @@ async function handleSync(userId: string): Promise<string> {
       })
       console.log('Temp branch created:', tempBranch)
     } catch (e: any) {
-      console.log('Could not create temp branch, trying to update existing...')
-      // If that fails, the upstream commit might not be accessible
-      // This means the fork needs to fetch from upstream
-      throw new Error(`Cannot access upstream commit ${shortUpstream} in fork. Please run:\n\`\`\`git remote add upstream https://github.com/${UPSTREAM_OWNER}/${UPSTREAM_REPO}.git\ngit fetch upstream\n\`\`\`\nThen try /sync again.`)
+      throw new Error(`Cannot access upstream commit ${shortUpstream} in fork. Please run:\n\`\`\`git remote add upstream https://github.com/${UPSTREAM_OWNER}/${UPSTREAM_REPO}.git\ngit fetch upstream\ngit merge upstream/${UPSTREAM_BRANCH}\ngit push\`\`\``)
     }
     
     // Try to merge the temp branch
@@ -227,20 +261,30 @@ async function handleSync(userId: string): Promise<string> {
         })
       } catch {}
       
+      // Handle 204 No Content (merge was successful but nothing changed)
       if (!mergeResp) {
-        // Check if branch was updated anyway
         const updatedFork = await githubRequest(`/repos/${GITHUB_OWNER}/${GITHUB_REPO}/git/refs/heads/${TARGET_BRANCH}`)
+        
+        // Check if we're now at the upstream commit
         if (updatedFork.object.sha === upstreamSha) {
-          console.log('Branch was fast-forwarded to upstream')
+          console.log('Branch updated to upstream SHA')
           await logToSupabase('sync_logs', {
             triggered_by: userId,
             upstream_sha: upstreamSha,
             merge_sha: upstreamSha,
             status: 'success',
           })
-          return `✅ Sync successful (fast-forward)!\n\n**Upstream SHA:** \`${shortUpstream}\`\n**Branch:** ${UPSTREAM_OWNER}/${UPSTREAM_BRANCH} → ${GITHUB_OWNER}/${TARGET_BRANCH}\n**Commits:** ${compare.ahead_by}`
+          return `✅ Sync successful (fast-forward)!\n\n**Upstream SHA:** \`${shortUpstream}\`\n**Branch:** ${UPSTREAM_OWNER}/${UPSTREAM_BRANCH} → ${GITHUB_OWNER}/${TARGET_BRANCH}`
         }
-        throw new Error('Merge failed and branch was not updated')
+        
+        // If SHAs still don't match but merge returned 204, it means nothing to merge
+        await logToSupabase('sync_logs', {
+          triggered_by: userId,
+          upstream_sha: upstreamSha,
+          merge_sha: forkSha,
+          status: 'already_up_to_date',
+        })
+        return `✅ Already up to date\n\n**Upstream commit:** \`${shortUpstream}\` is already in your ${TARGET_BRANCH} branch\n**Current HEAD:** \`${shortFork}\``
       }
       
       console.log('Merge successful')
