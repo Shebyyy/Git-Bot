@@ -1,0 +1,22 @@
+{
+  "name": "discord-github-bot",
+  "version": "1.0.0",
+  "description": "Discord bot for managing GitHub fork repository via Supabase Edge Functions",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "register-commands": "node scripts/register-commands.js"
+  },
+  "keywords": [
+    "discord",
+    "github",
+    "supabase",
+    "bot"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "discord.js": "^14.14.1",
+    "dotenv": "^16.4.1"
+  }
+}
