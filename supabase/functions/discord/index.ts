@@ -131,19 +131,26 @@ async function processCommand(commandName: string, options: any[], token: string
 }
 
 async function handleSync(userId: string): Promise<string> {
+  console.log('Starting sync for user:', userId)
+  
   // Fetch upstream SHA
+  console.log('Fetching upstream SHA...')
   const upstreamResp = await githubRequest(`/repos/${UPSTREAM_OWNER}/${UPSTREAM_REPO}/git/refs/heads/${UPSTREAM_BRANCH}`)
   const upstreamSha = upstreamResp.object.sha
+  console.log('Upstream SHA:', upstreamSha.substring(0, 7))
   
   // Fetch fork SHA
+  console.log('Fetching fork SHA...')
   const forkResp = await githubRequest(`/repos/${GITHUB_OWNER}/${GITHUB_REPO}/git/refs/heads/${TARGET_BRANCH}`)
   const forkSha = forkResp.object.sha
+  console.log('Fork SHA:', forkSha.substring(0, 7))
   
   const shortUpstream = upstreamSha.substring(0, 7)
   const shortFork = forkSha.substring(0, 7)
   
   // Check if already synced
   if (upstreamSha === forkSha) {
+    console.log('Already up to date')
     await logToSupabase('sync_logs', {
       triggered_by: userId,
       upstream_sha: upstreamSha,
@@ -154,16 +161,22 @@ async function handleSync(userId: string): Promise<string> {
     return `✅ Already up to date\n\n**Branch:** ${TARGET_BRANCH}\n**Current SHA:** \`${shortFork}\``
   }
   
+  console.log('Fork is behind, starting merge...')
+  
   // Try to merge
   try {
     // Check if upstream commit exists in fork
+    console.log('Checking if upstream commit exists in fork...')
     try {
       await githubRequest(`/repos/${GITHUB_OWNER}/${GITHUB_REPO}/git/commits/${upstreamSha}`)
-    } catch {
+      console.log('Upstream commit found in fork')
+    } catch (e: any) {
+      console.error('Upstream commit not found:', e)
       throw new Error(`Upstream commit ${shortUpstream} not found in fork. Please run: git remote add upstream https://github.com/${UPSTREAM_OWNER}/${UPSTREAM_REPO}.git && git fetch upstream`)
     }
 
     // Create temporary branch for upstream commit
+    console.log('Creating temporary branch...')
     const tempBranch = `temp-sync-${Date.now()}`
     try {
       await githubRequest(`/repos/${GITHUB_OWNER}/${GITHUB_REPO}/git/refs`, {
@@ -174,11 +187,13 @@ async function handleSync(userId: string): Promise<string> {
           sha: upstreamSha,
         }),
       })
+      console.log('Temp branch created:', tempBranch)
     } catch (e: any) {
       console.log('Temp branch check:', e.message)
     }
 
     // Merge using temp branch
+    console.log('Merging temp branch into target...')
     const mergeResp = await githubRequest(`/repos/${GITHUB_OWNER}/${GITHUB_REPO}/merges`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -189,12 +204,21 @@ async function handleSync(userId: string): Promise<string> {
       }),
     })
     
+    console.log('Merge response received')
+    if (!mergeResp) {
+      throw new Error('Merge API returned empty response')
+    }
+    
+    console.log('Merge successful, SHA:', mergeResp.sha.substring(0, 7))
+    
     // Delete temp branch
+    console.log('Deleting temp branch...')
     try {
       await githubRequest(`/repos/${GITHUB_OWNER}/${GITHUB_REPO}/git/refs/heads/${tempBranch}`, {
         method: 'DELETE',
       })
     } catch {}
+    console.log('Temp branch deleted')
     
     const mergeSha = mergeResp.sha
     const shortMerge = mergeSha.substring(0, 7)
@@ -397,7 +421,13 @@ async function githubRequest(endpoint: string, options: RequestInit = {}): Promi
     throw new Error(`GitHub API error (${response.status}): ${error}`)
   }
 
-  return response.json()
+  // Handle empty responses (like 204 No Content)
+  const text = await response.text()
+  if (!text) {
+    return null
+  }
+  
+  return JSON.parse(text)
 }
 
 async function logToSupabase(table: string, data: Record<string, any>): Promise<void> {
