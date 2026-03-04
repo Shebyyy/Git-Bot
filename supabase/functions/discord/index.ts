@@ -156,15 +156,45 @@ async function handleSync(userId: string): Promise<string> {
   
   // Try to merge
   try {
+    // Check if upstream commit exists in fork
+    try {
+      await githubRequest(`/repos/${GITHUB_OWNER}/${GITHUB_REPO}/git/commits/${upstreamSha}`)
+    } catch {
+      throw new Error(`Upstream commit ${shortUpstream} not found in fork. Please run: git remote add upstream https://github.com/${UPSTREAM_OWNER}/${UPSTREAM_REPO}.git && git fetch upstream`)
+    }
+
+    // Create temporary branch for upstream commit
+    const tempBranch = `temp-sync-${Date.now()}`
+    try {
+      await githubRequest(`/repos/${GITHUB_OWNER}/${GITHUB_REPO}/git/refs`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ref: `refs/heads/${tempBranch}`,
+          sha: upstreamSha,
+        }),
+      })
+    } catch (e: any) {
+      console.log('Temp branch check:', e.message)
+    }
+
+    // Merge using temp branch
     const mergeResp = await githubRequest(`/repos/${GITHUB_OWNER}/${GITHUB_REPO}/merges`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         base: TARGET_BRANCH,
-        head: `${UPSTREAM_OWNER}:${UPSTREAM_BRANCH}`,
+        head: tempBranch,
         commit_message: `Merge upstream/${UPSTREAM_BRANCH} into ${TARGET_BRANCH}`,
       }),
     })
+    
+    // Delete temp branch
+    try {
+      await githubRequest(`/repos/${GITHUB_OWNER}/${GITHUB_REPO}/git/refs/heads/${tempBranch}`, {
+        method: 'DELETE',
+      })
+    } catch {}
     
     const mergeSha = mergeResp.sha
     const shortMerge = mergeSha.substring(0, 7)
