@@ -1,7 +1,20 @@
 import { serve } from 'https://deno.land/std@0.168.0/http/server.ts'
 
+// Environment variables
+const DISCORD_PUBLIC_KEY = Deno.env.get('DISCORD_PUBLIC_KEY') || ''
+const DISCORD_TOKEN = Deno.env.get('DISCORD_TOKEN') || ''
+const DISCORD_CLIENT_ID = Deno.env.get('DISCORD_CLIENT_ID') || ''
+const GITHUB_TOKEN = Deno.env.get('GITHUB_TOKEN') || ''
+const GITHUB_OWNER = Deno.env.get('GITHUB_OWNER') || 'Shebyyy'
+const GITHUB_REPO = Deno.env.get('GITHUB_REPO') || 'AnymeX'
+const UPSTREAM_OWNER = Deno.env.get('UPSTREAM_OWNER') || 'RyanYuuki'
+const UPSTREAM_REPO = Deno.env.get('UPSTREAM_REPO') || 'AnymeX'
+const UPSTREAM_BRANCH = Deno.env.get('UPSTREAM_BRANCH') || 'main'
+const TARGET_BRANCH = Deno.env.get('TARGET_BRANCH') || 'beta'
+const SUPABASE_URL = Deno.env.get('SUPABASE_URL') || ''
+const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') || ''
+
 serve(async (req: Request) => {
-  // Handle CORS preflight
   if (req.method === 'OPTIONS') {
     return new Response(null, {
       headers: {
@@ -20,17 +33,8 @@ serve(async (req: Request) => {
     const body = await req.text()
     const signature = req.headers.get('X-Signature-Ed25519')
     const timestamp = req.headers.get('X-Signature-Timestamp')
-    const publicKey = Deno.env.get('DISCORD_PUBLIC_KEY') || ''
 
-    // Log for debugging
-    console.log('=== Discord Request ===')
-    console.log('Has signature:', !!signature)
-    console.log('Has timestamp:', !!timestamp)
-    console.log('Has public key:', !!publicKey)
-    console.log('Body length:', body.length)
-
-    if (!signature || !timestamp || !publicKey) {
-      console.log('Missing required headers')
+    if (!signature || !timestamp || !DISCORD_PUBLIC_KEY) {
       return new Response('Missing required headers', { status: 401 })
     }
 
@@ -38,16 +42,14 @@ serve(async (req: Request) => {
     const message = `${timestamp}${body}`
     const messageBytes = new TextEncoder().encode(message)
 
-    // Convert hex signature to Uint8Array
     const signatureBytes = new Uint8Array(signature.length / 2)
     for (let i = 0; i < signature.length; i += 2) {
       signatureBytes[i / 2] = parseInt(signature.substring(i, i + 2), 16)
     }
 
-    // Convert hex public key to Uint8Array (Discord provides hex, not base64!)
-    const publicKeyBytes = new Uint8Array(publicKey.length / 2)
-    for (let i = 0; i < publicKey.length; i += 2) {
-      publicKeyBytes[i / 2] = parseInt(publicKey.substring(i, i + 2), 16)
+    const publicKeyBytes = new Uint8Array(DISCORD_PUBLIC_KEY.length / 2)
+    for (let i = 0; i < DISCORD_PUBLIC_KEY.length; i += 2) {
+      publicKeyBytes[i / 2] = parseInt(DISCORD_PUBLIC_KEY.substring(i, i + 2), 16)
     }
 
     const publicKeyObj = await crypto.subtle.importKey(
@@ -65,44 +67,338 @@ serve(async (req: Request) => {
       messageBytes
     )
 
-    console.log('Signature valid:', isValid)
-
     if (!isValid) {
-      console.log('Invalid signature')
       return new Response('Invalid signature', { status: 401 })
     }
 
     const interaction = JSON.parse(body)
-    console.log('Interaction type:', interaction.type, 'Interaction:', JSON.stringify(interaction).substring(0, 200))
 
-    // Handle PING (type 1) - Respond immediately
+    // Handle PING
     if (interaction.type === 1) {
-      console.log('Responding with PONG')
-      const response = {
-        type: 1,
-      }
-      return new Response(JSON.stringify(response), {
+      return new Response(JSON.stringify({ type: 1 }), {
         headers: { 'Content-Type': 'application/json' },
-        status: 200,
       })
     }
 
-    // For all other interactions, we'll route to the appropriate function
-    // For now, just acknowledge
-    console.log('Acknowledging interaction')
-    const response = {
-      type: 5, // Deferred response
-      data: {},
+    // Handle APPLICATION_COMMAND
+    if (interaction.type === 2) {
+      const commandName = interaction.data.name
+      const userId = interaction.user?.id || interaction.member?.user?.id
+      const interactionToken = interaction.token
+
+      // Send deferred response
+      const response = {
+        type: 5,
+      }
+      
+      // Process command in background
+      processCommand(commandName, interaction.data.options, interactionToken, userId)
+      
+      return new Response(JSON.stringify(response), {
+        headers: { 'Content-Type': 'application/json' },
+      })
     }
-    return new Response(JSON.stringify(response), {
-      headers: { 'Content-Type': 'application/json' },
-      status: 200,
-    })
+
+    return new Response('Unknown interaction', { status: 400 })
 
   } catch (error) {
-    console.error('Error in discord function:', error)
+    console.error('Error:', error)
     return new Response(`Error: ${error.message}`, { status: 500 })
   }
 })
+
+async function processCommand(commandName: string, options: any[], token: string, userId: string) {
+  try {
+    let content = ''
+    
+    if (commandName === 'sync') {
+      content = await handleSync(userId)
+    } else if (commandName === 'tags') {
+      const subcommand = options?.[0]?.name
+      content = await handleTags(subcommand, options?.[0]?.options, userId)
+    } else if (commandName === 'branches') {
+      content = await handleBranches()
+    } else if (commandName === 'prs') {
+      const subcommand = options?.[0]?.name
+      content = await handlePRs(subcommand, options?.[0]?.options)
+    }
+    
+    await sendFollowUp(token, content)
+  } catch (error: any) {
+    console.error(`Error processing ${commandName}:`, error)
+    await sendFollowUp(token, `❌ Error: ${error.message}`)
+  }
+}
+
+async function handleSync(userId: string): Promise<string> {
+  // Fetch upstream SHA
+  const upstreamResp = await githubRequest(`/repos/${UPSTREAM_OWNER}/${UPSTREAM_REPO}/git/refs/heads/${UPSTREAM_BRANCH}`)
+  const upstreamSha = upstreamResp.object.sha
+  
+  // Fetch fork SHA
+  const forkResp = await githubRequest(`/repos/${GITHUB_OWNER}/${GITHUB_REPO}/git/refs/heads/${TARGET_BRANCH}`)
+  const forkSha = forkResp.object.sha
+  
+  const shortUpstream = upstreamSha.substring(0, 7)
+  const shortFork = forkSha.substring(0, 7)
+  
+  // Check if already synced
+  if (upstreamSha === forkSha) {
+    await logToSupabase('sync_logs', {
+      triggered_by: userId,
+      upstream_sha: upstreamSha,
+      merge_sha: forkSha,
+      status: 'already_up_to_date',
+    })
+    
+    return `✅ Already up to date\n\n**Branch:** ${TARGET_BRANCH}\n**Current SHA:** \`${shortFork}\``
+  }
+  
+  // Try to merge
+  try {
+    const mergeResp = await githubRequest(`/repos/${GITHUB_OWNER}/${GITHUB_REPO}/merges`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        base: TARGET_BRANCH,
+        head: `${UPSTREAM_OWNER}:${UPSTREAM_BRANCH}`,
+        commit_message: `Merge upstream/${UPSTREAM_BRANCH} into ${TARGET_BRANCH}`,
+      }),
+    })
+    
+    const mergeSha = mergeResp.sha
+    const shortMerge = mergeSha.substring(0, 7)
+    
+    await logToSupabase('sync_logs', {
+      triggered_by: userId,
+      upstream_sha: upstreamSha,
+      merge_sha: mergeSha,
+      status: 'success',
+    })
+    
+    return `✅ Sync successful!\n\n**Upstream SHA:** \`${shortUpstream}\`\n**Merge SHA:** \`${shortMerge}\`\n**Branch:** ${UPSTREAM_OWNER}/${UPSTREAM_BRANCH} → ${GITHUB_OWNER}/${TARGET_BRANCH}`
+    
+  } catch (error: any) {
+    if (error.message.includes('405') || error.message.includes('409')) {
+      await logToSupabase('sync_logs', {
+        triggered_by: userId,
+        upstream_sha: upstreamSha,
+        merge_sha: null,
+        status: 'conflict',
+      })
+      
+      return `⚠️ Merge conflict\n\n**Upstream SHA:** \`${shortUpstream}\`\n**Your SHA:** \`${shortFork}\`\n\nPlease resolve manually:\n\`\`\`git fetch upstream\ngit checkout ${TARGET_BRANCH}\ngit merge upstream/${UPSTREAM_BRANCH}\n# Resolve conflicts\ngit push\`\`\``
+    }
+    throw error
+  }
+}
+
+async function handleTags(subcommand: string, options: any[], userId: string): Promise<string> {
+  if (subcommand === 'list') {
+    const tags = await githubRequest(`/repos/${GITHUB_OWNER}/${GITHUB_REPO}/tags?per_page=15`)
+    
+    if (tags.length === 0) {
+      return '📋 No tags found'
+    }
+    
+    const tagList = tags.map((t: any, i: number) => 
+      `${i + 1}. **${t.name}** - \`${t.commit.sha.substring(0, 7)}\``
+    ).join('\n')
+    
+    return `📋 Tags (${tags.length})\n\n${tagList}`
+  }
+  
+  if (subcommand === 'create') {
+    const tagName = options?.find((o: any) => o.name === 'name')?.value
+    const tagMessage = options?.find((o: any) => o.name === 'message')?.value || `Release ${tagName}`
+    
+    if (!tagName) {
+      return '❌ Tag name is required'
+    }
+    
+    // Get latest commit SHA
+    const branchResp = await githubRequest(`/repos/${GITHUB_OWNER}/${GITHUB_REPO}/git/refs/heads/${TARGET_BRANCH}`)
+    const commitSha = branchResp.object.sha
+    
+    // Create tag object
+    const tagResp = await githubRequest(`/repos/${GITHUB_OWNER}/${GITHUB_REPO}/git/tags`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        tag: tagName,
+        message: tagMessage,
+        object: commitSha,
+        type: 'commit',
+      }),
+    })
+    
+    // Create ref
+    await githubRequest(`/repos/${GITHUB_OWNER}/${GITHUB_REPO}/git/refs`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ref: `refs/tags/${tagName}`,
+        sha: tagResp.sha,
+      }),
+    })
+    
+    await logToSupabase('tag_logs', {
+      triggered_by: userId,
+      tag_name: tagName,
+      tag_sha: tagResp.sha,
+      commit_sha: commitSha,
+      action: 'create',
+      status: 'success',
+    })
+    
+    return `✅ Tag created\n\n**Name:** ${tagName}\n**Commit:** \`${commitSha.substring(0, 7)}\`\n**Message:** ${tagMessage}`
+  }
+  
+  if (subcommand === 'delete') {
+    const tagName = options?.find((o: any) => o.name === 'name')?.value
+    
+    if (!tagName) {
+      return '❌ Tag name is required'
+    }
+    
+    await githubRequest(`/repos/${GITHUB_OWNER}/${GITHUB_REPO}/git/refs/tags/${tagName}`, {
+      method: 'DELETE',
+    })
+    
+    await logToSupabase('tag_logs', {
+      triggered_by: userId,
+      tag_name: tagName,
+      action: 'delete',
+      status: 'success',
+    })
+    
+    return `✅ Tag deleted: **${tagName}**`
+  }
+  
+  return '❓ Unknown tags command'
+}
+
+async function handleBranches(): Promise<string> {
+  const branches = await githubRequest(`/repos/${GITHUB_OWNER}/${GITHUB_REPO}/branches?per_page=100`)
+  
+  if (branches.length === 0) {
+    return '🌿 No branches found'
+  }
+  
+  // Check protections
+  const protections: Record<string, boolean> = {}
+  
+  await Promise.all(branches.map(async (branch: any) => {
+    try {
+      await githubRequest(`/repos/${GITHUB_OWNER}/${GITHUB_REPO}/branches/${branch.name}/protection`)
+      protections[branch.name] = true
+    } catch {
+      protections[branch.name] = false
+    }
+  }))
+  
+  const branchList = branches.slice(0, 25).map((b: any) => {
+    const icon = protections[b.name] ? '🔒' : '🔓'
+    return `${icon} **${b.name}** - \`${b.commit.sha.substring(0, 7)}\``
+  }).join('\n')
+  
+  return `🌿 Branches (${branches.length} total)\n\n${branchList}`
+}
+
+async function handlePRs(subcommand: string, options: any[]): Promise<string> {
+  if (subcommand === 'list') {
+    const state = options?.find((o: any) => o.name === 'state')?.value || 'open'
+    const prs = await githubRequest(`/repos/${GITHUB_OWNER}/${GITHUB_REPO}/pulls?state=${state}&per_page=15`)
+    
+    if (prs.length === 0) {
+      return `📋 No ${state} PRs found`
+    }
+    
+    const prList = prs.map((pr: any) => {
+      const icon = pr.state === 'open' ? '🟢' : pr.state === 'closed' ? '🔴' : '🟣'
+      return `${icon} **#${pr.number}** ${pr.title}\n   👤 ${pr.user.login} | ${pr.head.ref} → ${pr.base.ref}`
+    }).join('\n\n')
+    
+    return `📋 PRs (${state.toUpperCase()} - ${prs.length})\n\n${prList}`
+  }
+  
+  if (subcommand === 'view') {
+    const prNumber = options?.find((o: any) => o.name === 'number')?.value
+    
+    if (!prNumber) {
+      return '❌ PR number is required'
+    }
+    
+    const pr = await githubRequest(`/repos/${GITHUB_OWNER}/${GITHUB_REPO}/pulls/${prNumber}`)
+    
+    const statusIcon = pr.state === 'open' ? '🟢' : pr.state === 'closed' ? '🔴' : '🟣'
+    const mergeStatus = pr.merged ? '✅ Merged' : pr.mergeable === false ? '❌ Conflicted' : pr.mergeable ? '✅ Mergeable' : '⏳ Pending'
+    
+    return `🔍 PR #${pr.number} - ${pr.title}\n\n` +
+      `**Status:** ${statusIcon} ${pr.state.toUpperCase()} ${pr.merged ? '(Merged)' : ''}\n` +
+      `**Merge Status:** ${mergeStatus}\n` +
+      `**Author:** ${pr.user.login}\n` +
+      `**Branches:** ${pr.head.ref} → ${pr.base.ref}\n` +
+      `**Commits:** ${pr.commits}\n` +
+      `**Files:** ${pr.changed_files}\n` +
+      `**Additions:** +${pr.additions} | **Deletions:** -${pr.deletions}\n` +
+      `**Created:** ${new Date(pr.created_at).toLocaleDateString()}\n` +
+      `**URL:** ${pr.html_url}`
+  }
+  
+  return '❓ Unknown PRs command'
+}
+
+async function githubRequest(endpoint: string, options: RequestInit = {}): Promise<any> {
+  const url = `https://api.github.com${endpoint}`
+  
+  const response = await fetch(url, {
+    ...options,
+    headers: {
+      'Authorization': `Bearer ${GITHUB_TOKEN}`,
+      'Accept': 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28',
+      ...options.headers,
+    },
+  })
+
+  if (!response.ok) {
+    const error = await response.text()
+    throw new Error(`GitHub API error (${response.status}): ${error}`)
+  }
+
+  return response.json()
+}
+
+async function logToSupabase(table: string, data: Record<string, any>): Promise<void> {
+  try {
+    await fetch(`${SUPABASE_URL}/rest/v1/${table}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'apikey': SUPABASE_SERVICE_ROLE_KEY,
+        'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+        'Prefer': 'return=minimal',
+      },
+      body: JSON.stringify(data),
+    })
+  } catch (error) {
+    console.error('Failed to log to Supabase:', error)
+  }
+}
+
+async function sendFollowUp(token: string, content: string): Promise<void> {
+  await fetch(
+    `https://discord.com/api/v10/webhooks/${DISCORD_CLIENT_ID}/${token}`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bot ${DISCORD_TOKEN}`,
+      },
+      body: JSON.stringify({ content }),
+    }
+  )
+}
 
 export default {}
