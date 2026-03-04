@@ -49,13 +49,22 @@ export async function verifyDiscordRequest(
   const message = `${timestamp}${body}`
   
   try {
-    const publicKeyBytes = base64ToUint8Array(DISCORD_PUBLIC_KEY)
+    const publicKeyBytes = hexToUint8Array(DISCORD_PUBLIC_KEY)
     const signatureBytes = hexToUint8Array(signature)
     const messageBytes = new TextEncoder().encode(message)
 
-    const isValid = await crypto.subtle.verify(
-      'Ed25519',
+    // Import the public key
+    const publicKey = await crypto.subtle.importKey(
+      'raw',
       publicKeyBytes,
+      { name: 'Ed25519' },
+      false,
+      ['verify']
+    )
+
+    const isValid = await crypto.subtle.verify(
+      { name: 'Ed25519' },
+      publicKey,
       signatureBytes,
       messageBytes
     )
@@ -68,19 +77,7 @@ export async function verifyDiscordRequest(
 }
 
 /**
- * Helper: Convert base64 to Uint8Array
- */
-function base64ToUint8Array(base64: string): Uint8Array {
-  const binaryString = atob(base64)
-  const bytes = new Uint8Array(binaryString.length)
-  for (let i = 0; i < binaryString.length; i++) {
-    bytes[i] = binaryString.charCodeAt(i)
-  }
-  return bytes
-}
-
-/**
- * Helper: Convert hex string to Uint8Array
+ * Helper: Convert hex to Uint8Array
  */
 function hexToUint8Array(hex: string): Uint8Array {
   const bytes = new Uint8Array(hex.length / 2)
