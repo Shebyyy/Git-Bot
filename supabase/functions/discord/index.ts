@@ -13,6 +13,44 @@ const UPSTREAM_BRANCH = Deno.env.get('UPSTREAM_BRANCH') || 'main'
 const TARGET_BRANCH = Deno.env.get('TARGET_BRANCH') || 'beta'
 const SUPABASE_URL = Deno.env.get('SUPABASE_URL') || ''
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') || ''
+const ALLOWED_USERS = Deno.env.get('ALLOWED_USERS') || ''
+
+/**
+ * Check if a user is authorized to use the bot
+ * Checks both environment variable and database
+ */
+async function isUserAuthorized(userId: string): Promise<boolean> {
+  // Check environment variable first (comma-separated user IDs)
+  const allowedFromEnv = ALLOWED_USERS.split(',').map(id => id.trim()).filter(id => id)
+  if (allowedFromEnv.includes(userId)) {
+    console.log('User authorized via environment variable:', userId)
+    return true
+  }
+  
+  // Check database
+  try {
+    const response = await fetch(
+      `${SUPABASE_URL}/rest/v1/allowed_users?discord_user_id=eq.${userId}&select=id`,
+      {
+        headers: {
+          'apikey': SUPABASE_SERVICE_ROLE_KEY,
+          'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+        },
+      }
+    )
+    
+    const data = await response.json()
+    if (Array.isArray(data) && data.length > 0) {
+      console.log('User authorized via database:', userId)
+      return true
+    }
+  } catch (error) {
+    console.error('Error checking authorization:', error)
+  }
+  
+  console.log('User NOT authorized:', userId)
+  return false
+}
 
 serve(async (req: Request) => {
   if (req.method === 'OPTIONS') {
@@ -109,6 +147,13 @@ serve(async (req: Request) => {
 
 async function processCommand(commandName: string, options: any[], token: string, userId: string) {
   try {
+    // Check authorization first
+    const authorized = await isUserAuthorized(userId)
+    if (!authorized) {
+      await sendFollowUp(token, '❌ You are not authorized to use this bot. Contact the bot owner for access.')
+      return
+    }
+    
     let content = ''
     
     if (commandName === 'sync') {
